@@ -17,7 +17,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 版本信息，请勿修改
 # =================
-SHELL_VERSION=23
+SHELL_VERSION=24
 CONFIG_VERSION=6
 INIT_VERSION=3
 # =================
@@ -68,6 +68,7 @@ D_INTERVAL=20
 D_RESEND=2
 D_NC=1
 D_SOCKBUF=4194304
+D_SMUXBUF=4194304
 D_KEEPALIVE=10
 # ======================
 
@@ -781,8 +782,7 @@ install_deps() {
 				fi
 
 				# CentOS 等红帽系操作系统的软件库中可能不包括 python-pip
-				# 通常需要先安装 epel-release 扩展库
-				# 先在这里尝试安装 python-pip
+				# 可以先安装 epel-release
 				if ! command_exists pip; then
 					( set -x; sleep 3; yum -y -q install python-pip || true )
 				fi
@@ -831,64 +831,72 @@ install_supervisor() {
 		exit 1
 	fi
 
+	if ! command_exists python; then
+		cat >&2 <<-'EOF'
+		python 环境未安装，并且自动安装失败，请手动安装 python 环境。
+		EOF
+
+		exit 1
+	fi
+
+	local python_version="$(python -V 2>&1)"
+
+	if [ "$?" != "0" ] || [ -z "$python_version" ]; then
+		cat >&2 <<-'EOF'
+		python 环境已损坏，无法通过 python -V 来获取版本号。
+		请手动重装 python 环境。
+		EOF
+
+		exit 1
+	fi
+
+	local version_string="$(echo "$python_version" | cut -d' ' -f2 | head -n1)"
+	local major_version="$(echo "$version_string" | cut -d'.' -f1)"
+	local minor_version="$(echo "$version_string" | cut -d'.' -f2)"
+
+	if [ -z "$major_version" ] || [ -z "$minor_version" ] || \
+		! ( is_number "$major_version" ); then
+		cat >&2 <<-EOF
+		获取 python 大小版本号失败：${python_version}
+		EOF
+
+		exit 1
+	fi
+
+	local is_python_26="false"
+
+	if [ "$major_version" -lt "2" ] || ( \
+		[ "$major_version" = "2" ] && [ "$minor_version" -lt "6" ] ); then
+		cat >&2 <<-EOF
+		不支持的 python 版本 ${version_string}，当前仅支持 python 2.6 及以上版本的安装。
+		EOF
+
+		exit 1
+	elif [ "$major_version" = "2" ] && [ "$minor_version" = "6" ]; then
+		is_python_26="true"
+
+		cat >&1 <<-EOF
+		注意：当前服务器的 python 版本为 ${version_string},
+		脚本对 python 2.6 及以下版本的支持可能会失效，
+		请尽快升级 python 版本到 >= 2.7.9 或 >= 3.4。
+		EOF
+
+		any_key_to_continue
+	fi
+
 	if ! command_exists pip; then
 		# 如果没有监测到 pip 命令，但当前服务器已经安装 python
 		# 使用 get-pip.py 脚本来安装 pip 命令
-		if command_exists python; then
-			local python_version="$(python -V 2>&1)"
-
-			if [ "$?" != "0" ]; then
-				cat >&2 <<-EOF
-				python 环境已损坏，或无法通过 python -V 来获取版本号。
-				EOF
-
-				exit 1
-			fi
-
-			local version_string="$(echo "$python_version" | cut -d' ' -f2 | head -n1)"
-			local major_version="$(echo "$version_string" | cut -d'.' -f1)"
-			local minor_version="$(echo "$version_string" | cut -d'.' -f2)"
-
-			if [ -z "$major_version" ] || [ -z "$minor_version" ] || \
-				! ( is_number "$major_version" ); then
-				cat >&2 <<-EOF
-				获取 python 版本号失败：${python_version}
-				EOF
-				exit 1
-			fi
-
-			if [ "$major_version" -lt "2" ]; then
-				cat >&2 <<-EOF
-				不支持的 python 版本 ${version_string}，当前仅支持 python 2.6 及以上版本的安装。
-				EOF
-				exit 1
-			fi
-
-			local is_python_26="false"
-
-			if [ "$major_version" = "2" ] && [ "$minor_version" = "6" ]; then
-				is_python_26="true"
-
-				cat >&1 <<-EOF
-				注意：当前服务器的 python 版本为 ${version_string},
-				脚本对 python 2.6 及以下版本的支持可能会失效，
-				请尽快升级 python 版本到 >= 2.7.9 或 >= 3.4。
-				EOF
-
-				any_key_to_continue
-			fi
-
-			if [ "$is_python_26" = "true" ]; then
-				(
-					set -x
-					wget -qO- --no-check-certificate https://bootstrap.pypa.io/2.6/get-pip.py | python
-				)
-			else
-				(
-					set -x
-					wget -qO- --no-check-certificate https://bootstrap.pypa.io/get-pip.py | python
-				)
-			fi
+		if [ "$is_python_26" = "true" ]; then
+			(
+				set -x
+				wget -qO- --no-check-certificate https://bootstrap.pypa.io/2.6/get-pip.py | python
+			)
+		else
+			(
+				set -x
+				wget -qO- --no-check-certificate https://bootstrap.pypa.io/get-pip.py | python
+			)
 		fi
 	fi
 
@@ -903,16 +911,20 @@ install_supervisor() {
 
 		2. 对于 Redhat 系的 Linux 系统，可以尝试使用：
 		  sudo yum install -y python-pip 来进行安装
-		  * 注：如果提示未找到该软件，请先使用以下命令来安装扩展软件仓库：
-		      sudo yum install -y epel-release
-		    然后再次安装 python-pip
+		  * 如果提示未找到，可以先尝试安装：epel-release 扩展软件库
 
 		3. 如果以上方法都失败了，请使用以下命令来手动安装：
 		  wget -qO- --no-check-certificate https://bootstrap.pypa.io/get-pip.py | python
 		  * python 2.6 的用户请使用：
 		    wget -qO- --no-check-certificate https://bootstrap.pypa.io/2.6/get-pip.py | python
 
-		pip 安装完毕之后，请重新运行安装脚本。
+		4. pip 安装完毕之后，先运行一下更新命令：
+		  pip install --upgrade pip
+
+		  再检查一下 pip 的版本：
+		  pip -V
+
+		一切无误后，请重新运行安装脚本。
 		EOF
 		exit 1
 	fi
@@ -922,19 +934,32 @@ install_supervisor() {
 		检测到当前环境的 pip 命令已损坏，
 		请检查你的 python 环境。
 		EOF
+
 		exit 1
-	else
-		# 已安装 pip 时先尝试更新一下
+	fi
+
+	if [ "$is_python_26" != "true" ]; then
+		# 已安装 pip 时先尝试更新一下，
+		# 如果是 python 2.6，就不要更新了，更新会导致 pip 损坏
+		# pip 只支持 python 2 >= 2.7.9
+		# https://pip.pypa.io/en/stable/installing/
 		(
 			set -x
 			pip install --upgrade pip || true
 		)
 	fi
 
-	(
-		set -x
-		pip install supervisor
-	)
+	if [ "$is_python_26" = "true" ]; then
+		(
+			set -x
+			pip install supervisor==3.4.0
+		)
+	else
+		(
+			set -x
+			pip install --upgrade supervisor
+		)
+	fi
 
 	if [ "$?" != "0" ]; then
 		cat >&2 <<-EOF
@@ -942,6 +967,9 @@ install_supervisor() {
 		请尝试使用
 		  pip install supervisor
 		来手动安装。
+		Supervisor 从 4.0 开始已不支持 python 2.6 及以下版本
+		python 2.6 的用户请使用：
+		  pip install supervisor==3.4.0
 		EOF
 
 		exit 1
@@ -1612,6 +1640,7 @@ set_kcptun_config() {
 	unset_hidden_parameters() {
 		acknodelay=""
 		sockbuf=""
+		smuxbuf=""
 		keepalive=""
 		cat >&1 <<-EOF
 		---------------------------
@@ -1869,6 +1898,31 @@ set_hidden_parameters() {
 	---------------------------
 	EOF
 
+	[ -z "$smuxbuf" ] && smuxbuf="$D_SMUXBUF"
+	while true
+	do
+		cat >&1 <<-'EOF'
+		请设置 de-mux 缓冲区大小(smuxbuf)
+		EOF
+		read -p "(单位: MB, 默认: $(expr ${smuxbuf} / 1024 / 1024)): " input
+		if [ -n "$input" ]; then
+			if ! is_number "$input" || [ $input -le 0 ]; then
+				echo "输入有误, 请输入大于0的数字!"
+				continue
+			fi
+
+			smuxbuf=$(expr $input * 1024 * 1024)
+		fi
+		break
+	done
+
+	input=""
+	cat >&1 <<-EOF
+	---------------------------
+	smuxbuf = ${smuxbuf}
+	---------------------------
+	EOF
+
 	[ -z "$keepalive" ] && keepalive="$D_KEEPALIVE"
 	while true
 	do
@@ -1974,7 +2028,7 @@ gen_kcptun_config() {
 	}
 
 	write_configs_to_file "quiet" "snmplog" "snmpperiod" "pprof" "acknodelay" "nodelay" \
-		"interval" "resend" "nc" "sockbuf" "keepalive"
+		"interval" "resend" "nc" "sockbuf" "smuxbuf" "keepalive"
 
 	if ! grep -q "^${run_user}:" '/etc/passwd'; then
 		(
@@ -2216,7 +2270,7 @@ show_current_instance_info() {
 
 	show_configs "key" "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
 		"parityshard" "dscp" "nocomp" "quiet" "nodelay" "interval" "resend" \
-		"nc" "acknodelay" "sockbuf" "keepalive"
+		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
 
 	show_version_and_client_url
 
@@ -2258,7 +2312,7 @@ show_current_instance_info() {
 
 	gen_client_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
 		"parityshard" "dscp" "nocomp" "quiet" "nodelay" "interval" "resend" \
-		"nc" "acknodelay" "sockbuf" "keepalive"
+		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
 
 	cat >&1 <<-EOF
 
@@ -2292,7 +2346,7 @@ show_current_instance_info() {
 
 	gen_client_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
 		"parityshard" "dscp" "nocomp" "quiet" "nodelay" "interval" "resend" \
-		"nc" "acknodelay" "sockbuf" "keepalive"
+		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
 
 	cat >&1 <<-EOF
 
@@ -2499,13 +2553,6 @@ do_update() {
 			set -sed -i "s/^INIT_VERSION=${INIT_VERSION}/INIT_VERSION=${new_init_version}/" \
 				"$shell_path"
 		fi
-	fi
-
-	# 如果是通过 pip 安装的
-	if ( pip list --format columns 2>/dev/null | grep -q "supervisor" ); then
-		pip install --upgrade pip supervisor >/dev/null 2>&1
-	else
-		easy_install -U supervisor >/dev/null 2>&1
 	fi
 
 	echo "开始获取 Kcptun 版本信息..."
