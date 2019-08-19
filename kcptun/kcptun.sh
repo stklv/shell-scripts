@@ -17,7 +17,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 版本信息，请勿修改
 # =================
-SHELL_VERSION=24
+SHELL_VERSION=25
 CONFIG_VERSION=6
 INIT_VERSION=3
 # =================
@@ -58,6 +58,7 @@ D_PARITYSHARD=3
 D_DSCP=0
 D_NOCOMP='false'
 D_QUIET='false'
+D_TCP='false'
 D_SNMPPERIOD=60
 D_PPROF='false'
 
@@ -1003,6 +1004,8 @@ install_supervisor() {
 
 	local cfg_file='/etc/supervisor/supervisord.conf'
 
+	local rvt="0"
+
 	if [ ! -s "$cfg_file" ]; then
 		if ! command_exists echo_supervisord_conf; then
 			cat >&2 <<-'EOF'
@@ -1012,42 +1015,49 @@ install_supervisor() {
 			exit 1
 		fi
 
-		local config_content="$(echo_supervisord_conf 2>&1)"
-		local rvt="$?"
+		(
+			set -x
+			echo_supervisord_conf >"$cfg_file" 2>&1
+		)
+		rvt="$?"
+	fi
 
-		if [ "$rvt" = "0" ] ; then
-			echo "$config_content" >"$cfg_file"
-		else
-			if ( echo "$config_content" | grep -q "meld3" ) ; then
-				# https://github.com/Supervisor/meld3/issues/23
+	local cfg_content="$(cat "$cfg_file")"
+
+	# Error with supervisor config file
+	if ( echo "$cfg_content" | grep -q "Traceback (most recent call last)" ) ; then
+		rvt="1"
+
+		if ( echo "$cfg_content" | grep -q "DistributionNotFound: meld3" ); then
+			# https://github.com/Supervisor/meld3/issues/23
+			(
+				set -x
+				local temp="$(mktemp -d)"
+				local pwd="$(pwd)"
+
+				download_file 'https://pypi.python.org/packages/source/m/meld3/meld3-1.0.2.tar.gz' \
+					"$temp/meld3.tar.gz"
+
+				cd "$temp"
+				tar -zxf "$temp/meld3.tar.gz" --strip=1
+				python setup.py install
+				cd "$pwd"
+			)
+
+			if [ "$?" = "0" ] ; then
 				(
 					set -x
-					local temp="$(mktemp -d)"
-					local pwd="$(pwd)"
-
-					download_file 'https://pypi.python.org/packages/source/m/meld3/meld3-1.0.2.tar.gz' \
-						"$temp/meld3.tar.gz"
-
-					cd "$temp"
-					tar -zxf "$temp/meld3.tar.gz" --strip=1
-					python setup.py install
-					cd "$pwd"
+					echo_supervisord_conf >"$cfg_file" 2>/dev/null
 				)
-
-				if [ "$?" = "0" ] ; then
-					(
-						set -x
-						echo_supervisord_conf >"$cfg_file"
-					)
-					rvt="$?"
-				fi
-			fi
-
-			if [ "$rvt" != "0" ]; then
-				echo "创建 Supervisor 配置文件失败!"
-				exit 1
+				rvt="$?"
 			fi
 		fi
+	fi
+
+	if [ "$rvt" != "0" ]; then
+		rm -f "$cfg_file"
+		echo "创建 Supervisor 配置文件失败!"
+		exit 1
 	fi
 
 	if ! grep -q '^files[[:space:]]*=[[:space:]]*/etc/supervisor/conf.d/\*\.conf$' "$cfg_file"; then
@@ -1604,6 +1614,41 @@ set_kcptun_config() {
 	---------------------------
 	EOF
 
+	[ -z "$tcp" ] && tcp="$D_TCP"
+	while true
+	do
+		cat >&1 <<-'EOF'
+		是否使用 TCP 传输
+		EOF
+		read -p "(默认: ${tcp}) [y/n]: " yn
+		if [ -n "$yn" ]; then
+			case "$(first_character "$yn")" in
+				y|Y)
+					tcp='true'
+					;;
+				n|N)
+					tcp='false'
+					;;
+				*)
+					echo "输入有误，请重新输入!"
+					continue
+					;;
+			esac
+		fi
+		break
+	done
+
+	if [ "$tcp" = "true" ]; then
+		run_user="root"
+	fi
+
+	yn=""
+	cat >&1 <<-EOF
+	---------------------------
+	tcp = ${tcp}
+	---------------------------
+	EOF
+
 	unset_snmp() {
 		snmplog=""
 		snmpperiod=""
@@ -2027,7 +2072,9 @@ gen_kcptun_config() {
 	  "datashard": ${datashard},
 	  "parityshard": ${parityshard},
 	  "dscp": ${dscp},
-	  "nocomp": ${nocomp}
+	  "nocomp": ${nocomp},
+	  "quiet": ${quiet},
+	  "tcp": ${tcp}
 	}
 	EOF
 
@@ -2054,7 +2101,7 @@ gen_kcptun_config() {
 		fi
 	}
 
-	write_configs_to_file "quiet" "snmplog" "snmpperiod" "pprof" "acknodelay" "nodelay" \
+	write_configs_to_file "snmplog" "snmpperiod" "pprof" "acknodelay" "nodelay" \
 		"interval" "resend" "nc" "sockbuf" "smuxbuf" "keepalive"
 
 	if ! grep -q "^${run_user}:" '/etc/passwd'; then
@@ -2296,7 +2343,7 @@ show_current_instance_info() {
 	}
 
 	show_configs "key" "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
-		"parityshard" "dscp" "nocomp" "quiet" "nodelay" "interval" "resend" \
+		"parityshard" "dscp" "nocomp" "quiet" "tcp" "nodelay" "interval" "resend" \
 		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
 
 	show_version_and_client_url
@@ -2338,7 +2385,7 @@ show_current_instance_info() {
 	}
 
 	gen_client_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
-		"parityshard" "dscp" "nocomp" "quiet" "nodelay" "interval" "resend" \
+		"parityshard" "dscp" "nocomp" "quiet" "tcp" "nodelay" "interval" "resend" \
 		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
 
 	cat >&1 <<-EOF
@@ -2348,7 +2395,7 @@ show_current_instance_info() {
 	EOF
 
 	local mobile_config="key=${key}"
-	gen_client_configs() {
+	gen_mobile_configs() {
 		local k; local v
 		for k in "$@"; do
 			if [ "$k" = "sndwnd" ]; then
@@ -2371,8 +2418,8 @@ show_current_instance_info() {
 		done
 	}
 
-	gen_client_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
-		"parityshard" "dscp" "nocomp" "quiet" "nodelay" "interval" "resend" \
+	gen_mobile_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
+		"parityshard" "dscp" "nocomp" "quiet" "tcp" "nodelay" "interval" "resend" \
 		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
 
 	cat >&1 <<-EOF
@@ -2828,6 +2875,14 @@ instance_reconfig() {
 
 	if command_exists supervisorctl; then
 		supervisorctl restart "kcptun${current_instance_id}"
+
+		if [ "$?" != "0" ]; then
+			cat >&2 <<-'EOF'
+			重启 Supervisor 失败, Kcptun 无法正常工作!
+			请查看日志获取原因，或者反馈给脚本作者。
+			EOF
+			exit 1
+		fi
 	else
 		start_supervisor
 	fi
