@@ -17,8 +17,8 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 版本信息，请勿修改
 # =================
-SHELL_VERSION=25
-CONFIG_VERSION=6
+SHELL_VERSION=26
+CONFIG_VERSION=7
 INIT_VERSION=3
 # =================
 
@@ -56,7 +56,7 @@ D_RCVWND=512
 D_DATASHARD=10
 D_PARITYSHARD=3
 D_DSCP=0
-D_NOCOMP='false'
+D_NOCOMP='true'
 D_QUIET='false'
 D_TCP='false'
 D_SNMPPERIOD=60
@@ -68,9 +68,14 @@ D_NODELAY=1
 D_INTERVAL=20
 D_RESEND=2
 D_NC=1
-D_SOCKBUF=4194304
-D_SMUXBUF=4194304
+# SMUX提高到64M提高SreamBuf效果
+D_SOCKBUF=67108868
+D_SMUXBUF=67108868
 D_KEEPALIVE=10
+
+# KCP新版支持，SMux默认为2，BUF大小改为16M
+D_SMUXVER=2
+D_STREAMBUF=16777217
 # ======================
 
 # 当前选择的实例 ID
@@ -219,7 +224,7 @@ get_os_info() {
 		[ -r /etc/photon-release ] && lsb_dist='photon'
 		[ -r /etc/os-release ] && lsb_dist="$(. /etc/os-release && echo "$ID")"
 	fi
-	
+
 
 	lsb_dist="$(echo "$lsb_dist" | tr '[:upper:]' '[:lower:]')"
 
@@ -1197,19 +1202,56 @@ set_kcptun_config() {
 		cat >&1 <<-'EOF'
 		请输入 Kcptun 服务端运行端口 [1~65535]
 		这个端口就是 Kcptun 客户端连接的端口
+		新版支持端口范围，可输入[30000-35000]来开启端口范围
 		EOF
 		read -p "(默认: ${listen_port}): " input
+
 		if [ -n "$input" ]; then
-			if is_port "$input"; then
-				listen_port="$input"
+			if echo "$input" | grep -qE '^[0-9]+-[0-9]+$'; then
+				range_start=$(echo "$input" | cut -d'-' -f1)
+				range_end=$(echo "$input" | cut -d'-' -f2)
+
+				if [ "$range_start" -ge 1 ] && [ "$range_start" -le 65535 ] && \
+					[ "$range_end" -ge 1 ] && [ "$range_end" -le 65535 ] && \
+					[ "$range_start" -le "$range_end" ]; then
+					if echo "$current_listen_port" | grep -qE '^[0-9]+-[0-9]+$'; then
+						current_range_start=$(echo "$current_listen_port" | cut -d'-' -f1)
+						current_range_end=$(echo "$current_listen_port" | cut -d'-' -f2)
+
+						if [ "$range_start" -le "$current_range_end" ] && [ "$range_end" -ge "$current_range_start" ]; then
+							listen_port="$input"
+						else
+							echo "当前监听端口范围不在输入的范围内, 请重新输入!当前范围：${current_listen_port}"
+							continue
+						fi
+					else
+						listen_port="$input"
+					fi
+				else
+					echo "端口范围无效, 请输入类似 3000-5000 的有效端口范围!"
+					continue
+				fi
+			elif is_port "$input"; then
+				if echo "$current_listen_port" | grep -qE '^[0-9]+-[0-9]+$'; then
+					current_range_start=$(echo "$current_listen_port" | cut -d'-' -f1)
+					current_range_end=$(echo "$current_listen_port" | cut -d'-' -f2)
+
+					if [ "$input" -ge "$current_range_start" ] && [ "$input" -le "$current_range_end" ]; then
+						listen_port="$input"
+					else
+						echo "输入的端口不在当前监听端口范围内, 请重新输入!当前范围：${current_listen_port}"
+						continue
+					fi
+				else
+					listen_port="$input"
+				fi
 			else
-				echo "输入有误, 请输入 1~65535 之间的数字!"
+				echo "输入有误, 请输入 1~65535 之间的数字或有效的端口范围!"
 				continue
 			fi
 		fi
 
-		if port_using "$listen_port" && \
-			[ "$listen_port" != "$current_listen_port" ]; then
+		if port_using "$listen_port" && [ "$listen_port" != "$current_listen_port" ]; then
 			echo "端口已被占用, 请重新输入!"
 			continue
 		fi
@@ -1544,6 +1586,9 @@ set_kcptun_config() {
 	do
 		cat >&1 <<-'EOF'
 		是否关闭数据压缩?
+		对CPU性能有损耗
+		如果是文本类数据，可设手动开启
+		如果是数据套壳，则默认保持关闭直接
 		EOF
 		read -p "(默认: ${nocomp}) [y/n]: " yn
 		if [ -n "$yn" ]; then
@@ -1701,6 +1746,8 @@ set_kcptun_config() {
 		sockbuf=""
 		smuxbuf=""
 		keepalive=""
+		streambuf=""
+		smuxver=""
 		cat >&1 <<-EOF
 		---------------------------
 		不配置隐藏参数
@@ -1726,8 +1773,24 @@ set_kcptun_config() {
 		unset_hidden_parameters
 	fi
 
-	if [ $listen_port -le 1024 ]; then
-		run_user="root"
+	if echo "$input" | grep -qE '^[0-9]+-[0-9]+$'; then
+		range_start=$(echo "$input" | cut -d'-' -f1)
+		range_end=$(echo "$input" | cut -d'-' -f2)
+
+		if [ "$range_start" -ge 1 ] && [ "$range_start" -le 65535 ] && \
+			[ "$range_end" -ge 1 ] && [ "$range_end" -le 65535 ] && \
+			[ "$range_start" -le "$range_end" ]; then
+			# 新增端口段检测逻辑
+			if [ "$range_start" -le 1024 ] || [ "$range_end" -le 1024 ]; then
+				run_user="root"
+			fi
+		fi
+	elif is_port "$input"; then
+		listen_port="$input"
+		# 端口检测逻辑
+		if [ "$listen_port" -le 1024 ]; then
+			run_user="root"
+		fi
 	fi
 
 	echo "配置完成。"
@@ -2005,6 +2068,54 @@ set_hidden_parameters() {
 	keepalive = ${keepalive}
 	---------------------------
 	EOF
+
+	[ -z "$smuxver" ] && smuxver="$D_SMUXVER"
+	while true
+	do
+		cat >&1 <<-'EOF'
+		请设置 smux 的版本
+		EOF
+		read -p "(1,2, 默认值: ${smuxver}, 老版本默认1，新版本默认2): " input
+		if [ -n "$input" ]; then
+			if ! is_number "$input" || [ $input -le 0 ]; then
+				echo "输入有误, 请输入大于0的数字!"
+				continue
+			fi
+
+			smuxver=$input
+		fi
+		break
+	done
+
+	cat >&1 <<-EOF
+	---------------------------
+	$smuxver = ${smuxver}
+	---------------------------
+	EOF
+
+	[ -z "$streambuf" ] && streambuf="$D_STREAMBUF"
+	while true
+	do
+		cat >&1 <<-'EOF'
+		请设置 streambuf 大小，官方文档介绍本值不宜过大
+		EOF
+		read -p "(单位: MB, 默认: $(expr ${streambuf} / 1024 / 1024)): " input
+		if [ -n "$input" ]; then
+			if ! is_number "$input" || [ $input -le 0 ]; then
+				echo "输入有误, 请输入大于0的数字!"
+				continue
+			fi
+
+			streambuf=$(expr $input \* 1024 \* 1024)
+		fi
+		break
+	done
+
+	cat >&1 <<-EOF
+	---------------------------
+	streambuf = ${streambuf}
+	---------------------------
+	EOF
 }
 
 # 生成 Kcptun 服务端配置文件
@@ -2089,7 +2200,7 @@ gen_kcptun_config() {
 	}
 
 	write_configs_to_file "snmplog" "snmpperiod" "pprof" "acknodelay" "nodelay" \
-		"interval" "resend" "nc" "sockbuf" "smuxbuf" "keepalive"
+		"interval" "resend" "nc" "sockbuf" "smuxbuf" "keepalive" "streambuf" "smuxver"
 
 	if ! grep -q "^${run_user}:" '/etc/passwd'; then
 		(
@@ -2331,7 +2442,7 @@ show_current_instance_info() {
 
 	show_configs "key" "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
 		"parityshard" "dscp" "nocomp" "quiet" "tcp" "nodelay" "interval" "resend" \
-		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
+		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive" "streambuf" "smuxver"
 
 	show_version_and_client_url
 
@@ -2373,7 +2484,7 @@ show_current_instance_info() {
 
 	gen_client_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
 		"parityshard" "dscp" "nocomp" "quiet" "tcp" "nodelay" "interval" "resend" \
-		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
+		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive" "streambuf" "smuxver"
 
 	cat >&1 <<-EOF
 
@@ -2407,7 +2518,7 @@ show_current_instance_info() {
 
 	gen_mobile_configs "crypt" "mode" "mtu" "sndwnd" "rcvwnd" "datashard" \
 		"parityshard" "dscp" "nocomp" "quiet" "tcp" "nodelay" "interval" "resend" \
-		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive"
+		"nc" "acknodelay" "sockbuf" "smuxbuf" "keepalive" "streambuf" "smuxver"
 
 	cat >&1 <<-EOF
 
